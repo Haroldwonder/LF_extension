@@ -1,0 +1,234 @@
+import { Injectable } from '@nestjs/common';
+import { Server } from 'socket.io';
+import { WebSocketGateway, WebSocketServer, OnGatewayConnection, OnGatewayDisconnect } from '@nestjs/websockets';
+
+export interface PlayerStatus {
+  userId: string;
+  connectionId: string;
+  isActive: boolean;
+  isConnected: boolean;
+  lastActivity: Date;
+  deviceInfo: {
+    type: string;
+    orientation: string;
+    screenSize: string;
+  };
+  latency: number;
+  gameState: string;
+  currentAction?: string;
+}
+
+@WebSocketGateway({
+  cors: {
+    origin: '*',
+  },
+})
+@Injectable()
+export class PlayerStatusService implements OnGatewayConnection, OnGatewayDisconnect {
+  @WebSocketServer()
+  server: Server;
+
+  private playerStatuses: Map<string, PlayerStatus> = new Map();
+  
+  handleConnection(client: any, ...args: any[]) {
+    const userId = client.handshake.query.userId;
+    if (!userId) return;
+
+    // Initialize player status
+    const status: PlayerStatus = {
+      userId,
+      connectionId: client.id,
+      isActive: true,
+      isConnected: true,
+      lastActivity: new Date(),
+      deviceInfo: {
+        type: client.handshake.query.deviceType || 'unknown',
+        orientation: client.handshake.query.orientation || 'portrait',
+        screenSize: client.handshake.query.screenSize || 'medium',
+      },
+      latency: 0,
+      gameState: 'connected',
+    };
+
+    this.playerStatuses.set(userId, status);
+    
+    // Join a room specific to this user
+    client.join(`user-${userId}`);
+    
+    // Broadcast status update
+    this.broadcastStatusUpdate(userId);
+    
+    // Set up ping/pong for latency calculation
+    this.setupLatencyCheck(client, userId);
+  }
+
+  handleDisconnect(client: any) {
+    // Find user by connection ID
+    let userId: string | null = null;
+    
+    for (const [id, status] of this.playerStatuses.entries()) {
+      if (status.connectionId === client.id) {
+        userId = id;
+        break;
+      }
+    }
+    
+    if (userId) {
+      const status = this.playerStatuses.get(userId);
+      if (status) {
+        status.isConnected = false;
+        status.isActive = false;
+        status.gameState = 'disconnected';
+        this.playerStatuses.set(userId, status);
+        
+        // Broadcast status update
+        this.broadcastStatusUpdate(userId);
+        
+        // Remove status after a delay
+        setTimeout(() => {
+          if (this.playerStatuses.has(userId) && 
+              this.playerStatuses.get(userId).connectionId === client.id) {
+            this.playerStatuses.delete(userId);
+          }
+        }, 300000); // 5 minutes
+      }
+    }
+  }
+
+  private setupLatencyCheck(client: any, userId: string) {
+    // Send ping every 5 seconds
+    const interval = setInterval(() => {
+      const start = Date.now();
+      
+      client.emit('ping', { timestamp: start });
+      
+      client.on('pong', (data) => {
+        const latency = Date.now() - start;
+        
+        const status = this.playerStatuses.get(userId);
+        if (status) {
+          status.latency = latency;
+          status.lastActivity = new Date();
+          this.playerStatuses.set(userId, status);
+        }
+      });
+      
+    }, 5000);
+    
+    // Clear interval on disconnect
+    client.on('disconnect', () => {
+      clearInterval(interval);
+    });
+  }
+
+  updatePlayerStatus(userId: string, updates: Partial<PlayerStatus>): PlayerStatus {
+    const currentStatus = this.playerStatuses.get(userId);
+    
+    if (!currentStatus) {
+      throw new Error(`No status found for user ${userId}`);
+    }
+    
+    // Update status
+    const updatedStatus = {
+      ...currentStatus,
+      ...updates,
+      lastActivity: new Date()
+    };
+    
+    this.playerStatuses.set(userId, updatedStatus);
+    
+    // Broadcast status update
+    this.broadcastStatusUpdate(userId);
+    
+    return updatedStatus;
+  }
+
+  getPlayerStatus(userId: string): PlayerStatus | null {
+    return this.playerStatuses.get(userId) || null;
+  }
+
+  getAllPlayerStatuses(): PlayerStatus[] {
+    return Array.from(this.playerStatuses.values());
+  }
+
+  getActivePlayersCount(): number {
+    let count = 0;
+    for (const status of this.playerStatuses.values()) {
+      if (status.isActive && status.isConnected) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  broadcastStatusUpdate(userId: string) {
+    const status = this.playerStatuses.get(userId);
+    if (!status) return;
+    
+    // Broadcast to game rooms or admin dashboards
+    this.server.to('admin-dashboard').emit('player-status-update', status);
+    
+    // Also emit to the specific user's room
+    this.server.to(`user-${userId}`).emit('status-update', status);
+  }
+
+  broadcastGameEvent(gameId: string, event: string, data: any) {
+    this.server.to(`game-${gameId}`).emit(event, data);
+  }
+
+  joinGameRoom(userId: string, gameId: string) {
+    const connections = this.server.sockets.sockets;
+    
+    // Find the socket for this user
+    for (const [socketId, socket] of connections.entries()) {
+      if (socket.handshake.query.userId === userId) {
+        socket.join(`game-${gameId}`);
+        
+        // Update status
+        const status = this.playerStatuses.get(userId);
+        if (status) {
+          status.gameState = 'joined';
+          this.playerStatuses.set(userId, status);
+          this.broadcastStatusUpdate(userId);
+        }
+        
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
+  leaveGameRoom(userId: string, gameId: string) {
+    const connections = this.server.sockets.sockets;
+    
+    // Find the socket for this user
+    for (const [socketId, socket] of connections.entries()) {
+      if (socket.handshake.query.userId === userId) {
+        socket.leave(`game-${gameId}`);
+        
+        // Update status
+        const status = this.playerStatuses.get(userId);
+        if (status) {
+          status.gameState = 'connected';
+          this.playerStatuses.set(userId, status);
+          this.broadcastStatusUpdate(userId);
+        }
+        
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
+  updatePlayerAction(userId: string, action: string) {
+    const status = this.playerStatuses.get(userId);
+    if (status) {
+      status.currentAction = action;
+      status.lastActivity = new Date();
+      this.playerStatuses.set(userId, status);
+      this.broadcastStatusUpdate(userId);
+    }
+  }
+}
