@@ -1,0 +1,143 @@
+// src/statistics/controllers/statistics.controller.ts
+import { 
+  Controller, 
+  Get, 
+  Param, 
+  Query, 
+  UseGuards, 
+  NotFoundException, 
+  ForbiddenException, 
+  Logger 
+} from '@nestjs/common';
+import { 
+  ApiBearerAuth, 
+  ApiOperation, 
+  ApiParam, 
+  ApiQuery, 
+  ApiResponse, 
+  ApiTags 
+} from '@nestjs/swagger';
+import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../../auth/guards/roles.guard';
+import { Roles } from '../../auth/decorators/roles.decorator';
+import { User } from '../../auth/decorators/user.decorator';
+import { SessionAnalyticsService } from '../services/session-analytics.service';
+import { UserStatisticsService } from '../services/user-statistics.service';
+
+@ApiTags('statistics')
+@Controller('statistics')
+export class StatisticsController {
+  private readonly logger = new Logger(StatisticsController.name);
+
+  constructor(
+    private readonly sessionAnalyticsService: SessionAnalyticsService,
+    private readonly userStatisticsService: UserStatisticsService,
+  ) {}
+
+  @Get('sessions/:sessionId')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Get complete session statistics' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Session statistics retrieved successfully' })
+  @ApiResponse({ status: 403, description: 'Forbidden - not owner of the session' })
+  @ApiResponse({ status: 404, description: 'Session statistics not found' })
+  async getSessionStatistics(@Param('sessionId') sessionId: string, @User() user) {
+    try {
+      const stats = await this.userStatisticsService.getSessionOwnership(sessionId);
+      
+      if (!stats) {
+        throw new NotFoundException('Session statistics not found');
+      }
+      
+      // Check if user is the owner of the session or has admin role
+      if (stats.userId !== user.id && !user.roles?.includes('admin')) {
+        throw new ForbiddenException('You do not have permission to access these statistics');
+      }
+      
+      return stats;
+    } catch (error) {
+      this.logger.error(`Error fetching session statistics: ${error.message}`, error.stack);
+      throw error;
+    }
+  }
+
+  @Get('sessions/:sessionId/difficulty')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Get difficulty analysis for a session' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Difficulty analysis retrieved successfully' })
+  @ApiResponse({ status: 403, description: 'Forbidden - not owner of the session' })
+  @ApiResponse({ status: 404, description: 'Session statistics not found' })
+  async getDifficultyAnalysis(@Param('sessionId') sessionId: string, @User() user) {
+    try {
+      const stats = await this.userStatisticsService.getSessionOwnership(sessionId);
+      
+      if (!stats) {
+        throw new NotFoundException('Session statistics not found');
+      }
+      
+      // Check if user is the owner of the session or has admin role
+      if (stats.userId !== user.id && !user.roles?.includes('admin')) {
+        throw new ForbiddenException('You do not have permission to access these statistics');
+      }
+      
+      return this.sessionAnalyticsService.getDifficultyAnalysis(sessionId);
+    } catch (error) {
+      this.logger.error(`Error fetching difficulty analysis: ${error.message}`, error.stack);
+      throw error;
+    }
+  }
+
+  @Get('sessions/:sessionId/performance')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Get performance trends for a session' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Performance trends retrieved successfully' })
+  @ApiResponse({ status: 403, description: 'Forbidden - not owner of the session' })
+  @ApiResponse({ status: 404, description: 'Session statistics not found' })
+  async getPerformanceTrends(@Param('sessionId') sessionId: string, @User() user) {
+    try {
+      const stats = await this.userStatisticsService.getSessionOwnership(sessionId);
+      
+      if (!stats) {
+        throw new NotFoundException('Session statistics not found');
+      }
+      
+      // Check if user is the owner of the session or has admin role
+      if (stats.userId !== user.id && !user.roles?.includes('admin')) {
+        throw new ForbiddenException('You do not have permission to access these statistics');
+      }
+      
+      return this.sessionAnalyticsService.getPerformanceTrends(sessionId);
+    } catch (error) {
+      this.logger.error(`Error fetching performance trends: ${error.message}`, error.stack);
+      throw error;
+    }
+  }
+
+  @Get('sessions/:sessionId/response-time')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Get response time distribution for a session' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Response time distribution retrieved successfully' })
+  @ApiResponse({ status: 403, description: 'Forbidden - not owner of the session' })
+  @ApiResponse({ status: 404, description: 'Session statistics not found' })
+  async getResponseTimeDistribution(@Param('sessionId') sessionId: string, @User() user) {
+    try {
+      const stats = await this.userStatisticsService.getSessionOwnership(sessionId);
+      
+      if (!stats) {
+        throw new NotFoundException('Session statistics not found');
+      }
+      
+      // Check if user is the owner of the session or has admin role
+      if (stats.userId !== user.id && !user.roles?.includes('admin')) {
+        throw new ForbiddenException('You do not have permission to access these statistics');
+      }
+      
+      return this.sessionAnalyticsService.getResponseTimeDistribution(sessionId);
+    } catch (error

@@ -1,0 +1,560 @@
+// src/statistics/services/session-analytics.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { SessionStatistics } from '../entities/session-statistics.entity';
+import { UserStatistics } from '../entities/user-statistics.entity';
+import { User } from '../../users/entities/user.entity';
+import { GameSession } from '../../game-sessions/entities/game-session.entity';
+
+type SessionQuestion = {
+  id: string;
+  isCorrect: boolean;
+  skipped: boolean;
+  responseTime: number;
+  difficulty: string;
+  category: string;
+};
+
+@Injectable()
+export class SessionAnalyticsService {
+  private readonly logger = new Logger(SessionAnalyticsService.name);
+
+  constructor(
+    @InjectRepository(SessionStatistics)
+    private readonly sessionStatsRepository: Repository<SessionStatistics>,
+    @InjectRepository(UserStatistics)
+    private readonly userStatsRepository: Repository<UserStatistics>,
+  ) {}
+
+  /**
+   * Generate complete session statistics for a completed game session
+   * @param session Completed game session
+   * @param questions Array of question objects with answer data
+   * @param user User who completed the session
+   */
+  async generateSessionStatistics(
+    session: GameSession,
+    questions: SessionQuestion[],
+    user: User,
+  ): Promise<SessionStatistics> {
+    try {
+      // Calculate basic metrics
+      const startTime = new Date(session.startTime);
+      const endTime = new Date(session.endTime);
+      const duration = Math.round((endTime.getTime() - startTime.getTime()) / 1000); // in seconds
+      
+      const totalQuestions = questions.length;
+      const correctAnswers = questions.filter(q => q.isCorrect).length;
+      const incorrectAnswers = questions.filter(q => !q.isCorrect && !q.skipped).length;
+      const skippedQuestions = questions.filter(q => q.skipped).length;
+      const accuracyRate = totalQuestions > 0 ? (correctAnswers / totalQuestions) * 100 : 0;
+      
+      // Initialize difficulty breakdown
+      const difficultyBreakdown = {
+        easy: { total: 0, correct: 0, avgResponseTime: 0 },
+        medium: { total: 0, correct: 0, avgResponseTime: 0 },
+        hard: { total: 0, correct: 0, avgResponseTime: 0 }
+      };
+      
+      // Initialize response time distribution
+      const responseTimeDistribution = {
+        lessThan3Seconds: 0,
+        threeToFiveSeconds: 0,
+        fiveToTenSeconds: 0,
+        tenToThirtySeconds: 0,
+        moreThanThirtySeconds: 0
+      };
+
+      // Initialize category tracking
+      const categories: Record<string, { total: number; correct: number; responseTime: number }> = {};
+      
+      // Track streaks
+      let currentCorrectStreak = 0;
+      let maxCorrectStreak = 0;
+      let currentIncorrectStreak = 0;
+      let maxIncorrectStreak = 0;
+      
+      // Track response times
+      const responseTimeTrend = [];
+      
+      // Process each question
+      questions.forEach((question, index) => {
+        const difficulty = question.difficulty?.toLowerCase() || 'medium';
+        const category = question.category || 'uncategorized';
+        const responseTime = question.responseTime || 0;
+        
+        // Update difficulty breakdown
+        if (difficultyBreakdown[difficulty]) {
+          difficultyBreakdown[difficulty].total++;
+          if (question.isCorrect) {
+            difficultyBreakdown[difficulty].correct++;
+          }
+          difficultyBreakdown[difficulty].avgResponseTime += responseTime;
+        }
+        
+        // Update response time distribution
+        if (responseTime < 3000) {
+          responseTimeDistribution.lessThan3Seconds++;
+        } else if (responseTime < 5000) {
+          responseTimeDistribution.threeToFiveSeconds++;
+        } else if (responseTime < 10000) {
+          responseTimeDistribution.fiveToTenSeconds++;
+        } else if (responseTime < 30000) {
+          responseTimeDistribution.tenToThirtySeconds++;
+        } else {
+          responseTimeDistribution.moreThanThirtySeconds++;
+        }
+        
+        // Track category performance
+        if (!categories[category]) {
+          categories[category] = { total: 0, correct: 0, responseTime: 0 };
+        }
+        categories[category].total++;
+        if (question.isCorrect) {
+          categories[category].correct++;
+        }
+        categories[category].responseTime += responseTime;
+        
+        // Track response time trend
+        responseTimeTrend.push({
+          questionIndex: index,
+          responseTime,
+          isCorrect: question.isCorrect
+        });
+        
+        // Update streaks
+        if (question.isCorrect) {
+          currentCorrectStreak++;
+          currentIncorrectStreak = 0;
+          if (currentCorrectStreak > maxCorrectStreak) {
+            maxCorrectStreak = currentCorrectStreak;
+          }
+        } else if (!question.skipped) {
+          currentIncorrectStreak++;
+          currentCorrectStreak = 0;
+          if (currentIncorrectStreak > maxIncorrectStreak) {
+            maxIncorrectStreak = currentIncorrectStreak;
+          }
+        }
+      });
+      
+      // Calculate average response times for each difficulty
+      Object.keys(difficultyBreakdown).forEach(difficulty => {
+        const diffData = difficultyBreakdown[difficulty];
+        if (diffData.total > 0) {
+          diffData.avgResponseTime = diffData.avgResponseTime / diffData.total;
+        }
+      });
+      
+      // Calculate performance trend (accuracy over time)
+      const batchSize = 5; // Group questions in batches of 5
+      const performanceTrend = [];
+      
+      for (let i = 0; i < totalQuestions; i += batchSize) {
+        const batchEnd = Math.min(i + batchSize, totalQuestions);
+        const batchQuestions = questions.slice(i, batchEnd);
+        const batchCorrect = batchQuestions.filter(q => q.isCorrect).length;
+        const batchAccuracy = (batchCorrect / batchQuestions.length) * 100;
+        
+        performanceTrend.push({
+          questionsBatch: `${i+1}-${batchEnd}`,
+          accuracy: batchAccuracy
+        });
+      }
+      
+      // Format category performance
+      const categoryPerformance = Object.keys(categories).map(category => {
+        const catData = categories[category];
+        return {
+          category,
+          total: catData.total,
+          correct: catData.correct,
+          accuracy: catData.total > 0 ? (catData.correct / catData.total) * 100 : 0,
+          avgResponseTime: catData.total > 0 ? catData.responseTime / catData.total : 0
+        };
+      });
+      
+      // Get comparison metrics
+      const comparisonMetrics = await this.calculateComparisonMetrics(
+        user.id,
+        session.gameName,
+        session.gameMode,
+        accuracyRate,
+        duration,
+        session.score
+      );
+      
+      // Create new statistics entity
+      const sessionStatistics = this.sessionStatsRepository.create({
+        sessionId: session.id,
+        userId: user.id,
+        gameName: session.gameName,
+        gameMode: session.gameMode,
+        startTime,
+        endTime,
+        duration,
+        totalQuestions,
+        correctAnswers,
+        incorrectAnswers,
+        skippedQuestions,
+        accuracyRate,
+        score: session.score || 0,
+        difficultyBreakdown,
+        categoryPerformance,
+        responseTimeDistribution,
+        responseTimeTrend,
+        performanceTrend,
+        streaks: {
+          maxCorrectStreak,
+          maxIncorrectStreak,
+          currentCorrectStreak
+        },
+        device: session.device || 'unknown',
+        platform: session.platform || 'unknown',
+        tags: session.tags || [],
+        comparisonMetrics,
+        metadata: session.metadata || {}
+      });
+      
+      // Save to database
+      const savedStats = await this.sessionStatsRepository.save(sessionStatistics);
+      
+      // Update user statistics
+      await this.updateUserStatistics(user.id, sessionStatistics);
+      
+      return savedStats;
+    } catch (error) {
+      this.logger.error(`Error generating session statistics: ${error.message}`, error.stack);
+      throw error;
+    }
+  }
+
+  /**
+   * Calculate comparison metrics against user's historical performance
+   */
+  private async calculateComparisonMetrics(
+    userId: string,
+    gameName: string,
+    gameMode: string,
+    accuracy: number,
+    duration: number,
+    score: number
+  ): Promise<any> {
+    try {
+      // Get user's average metrics from previous sessions
+      const userStats = await this.userStatsRepository.findOne({ where: { userId } });
+      
+      if (!userStats) {
+        return {
+          accuracyDelta: 0,
+          timeDelta: 0,
+          scoreDelta: 0
+        };
+      }
+      
+      // Get game-specific metrics if available
+      const gameStats = userStats.gameStatistics.find(
+        gs => gs.gameName === gameName && gs.gameMode === gameMode
+      );
+      
+      if (!gameStats) {
+        return {
+          accuracyDelta: 0,
+          timeDelta: 0,
+          scoreDelta: 0
+        };
+      }
+      
+      // Calculate deltas
+      const accuracyDelta = accuracy - gameStats.averageAccuracy;
+      const timeDelta = gameStats.averageTime > 0 ? 
+        ((duration - gameStats.averageTime) / gameStats.averageTime) * 100 : 0;
+      const scoreDelta = gameStats.averageScore > 0 ?
+        ((score - gameStats.averageScore) / gameStats.averageScore) * 100 : 0;
+      
+      // Calculate percentile
+      const similarSessions = await this.sessionStatsRepository.find({
+        where: {
+          userId: { $ne: userId },
+          gameName,
+          gameMode
+        },
+        order: { score: 'DESC' },
+        take: 100
+      });
+      
+      let rank = 1;
+      let percentile = 100;
+      
+      if (similarSessions.length > 0) {
+        // Find rank
+        for (let i = 0; i < similarSessions.length; i++) {
+          if (score <= similarSessions[i].score) {
+            rank++;
+          }
+        }
+        
+        // Calculate percentile
+        percentile = 100 - ((rank / (similarSessions.length + 1)) * 100);
+      }
+      
+      return {
+        accuracyDelta,
+        timeDelta,
+        scoreDelta,
+        rank,
+        percentile
+      };
+    } catch (error) {
+      this.logger.error(`Error calculating comparison metrics: ${error.message}`, error.stack);
+      return { accuracyDelta: 0, timeDelta: 0, scoreDelta: 0 };
+    }
+  }
+
+  /**
+   * Update a user's aggregate statistics with new session data
+   */
+  private async updateUserStatistics(userId: string, sessionStats: SessionStatistics): Promise<void> {
+    try {
+      const userStats = await this.userStatsRepository.findOne({ where: { userId } });
+      
+      if (!userStats) {
+        // Create new user statistics if none exist
+        const newUserStats = this.userStatsRepository.create({
+          userId,
+          totalSessions: 1,
+          totalTimePlayed: sessionStats.duration,
+          totalQuestionsAnswered: sessionStats.totalQuestions,
+          totalCorrectAnswers: sessionStats.correctAnswers,
+          averageAccuracy: sessionStats.accuracyRate,
+          gameStatistics: [{
+            gameName: sessionStats.gameName,
+            gameMode: sessionStats.gameMode,
+            sessionsPlayed: 1,
+            bestScore: sessionStats.score,
+            averageScore: sessionStats.score,
+            bestAccuracy: sessionStats.accuracyRate,
+            averageAccuracy: sessionStats.accuracyRate,
+            totalTime: sessionStats.duration,
+            averageTime: sessionStats.duration,
+            lastPlayed: sessionStats.endTime
+          }],
+          timeDistribution: { mornings: 0, afternoons: 0, evenings: 0, nights: 0 },
+          weekdayDistribution: { 
+            monday: 0, tuesday: 0, wednesday: 0, thursday: 0, 
+            friday: 0, saturday: 0, sunday: 0 
+          },
+          progressMetrics: {
+            longestStreak: 1,
+            currentStreak: 1,
+            lastActiveDate: new Date(),
+            improvementRate: 0
+          },
+          achievements: []
+        });
+        
+        // Update time distribution
+        const hour = sessionStats.startTime.getHours();
+        if (hour >= 5 && hour < 12) {
+          newUserStats.timeDistribution.mornings = 1;
+        } else if (hour >= 12 && hour < 17) {
+          newUserStats.timeDistribution.afternoons = 1;
+        } else if (hour >= 17 && hour < 22) {
+          newUserStats.timeDistribution.evenings = 1;
+        } else {
+          newUserStats.timeDistribution.nights = 1;
+        }
+        
+        // Update weekday distribution
+        const day = sessionStats.startTime.getDay();
+        switch (day) {
+          case 0: newUserStats.weekdayDistribution.sunday = 1; break;
+          case 1: newUserStats.weekdayDistribution.monday = 1; break;
+          case 2: newUserStats.weekdayDistribution.tuesday = 1; break;
+          case 3: newUserStats.weekdayDistribution.wednesday = 1; break;
+          case 4: newUserStats.weekdayDistribution.thursday = 1; break;
+          case 5: newUserStats.weekdayDistribution.friday = 1; break;
+          case 6: newUserStats.weekdayDistribution.saturday = 1; break;
+        }
+        
+        await this.userStatsRepository.save(newUserStats);
+        return;
+      }
+      
+      // Update overall statistics
+      userStats.totalSessions += 1;
+      userStats.totalTimePlayed += sessionStats.duration;
+      userStats.totalQuestionsAnswered += sessionStats.totalQuestions;
+      userStats.totalCorrectAnswers += sessionStats.correctAnswers;
+      
+      // Recalculate average accuracy
+      const totalAnswers = userStats.totalQuestionsAnswered;
+      userStats.averageAccuracy = totalAnswers > 0 ? 
+        (userStats.totalCorrectAnswers / totalAnswers) * 100 : 0;
+      
+      // Update time distribution
+      const hour = sessionStats.startTime.getHours();
+      if (hour >= 5 && hour < 12) {
+        userStats.timeDistribution.mornings += 1;
+      } else if (hour >= 12 && hour < 17) {
+        userStats.timeDistribution.afternoons += 1;
+      } else if (hour >= 17 && hour < 22) {
+        userStats.timeDistribution.evenings += 1;
+      } else {
+        userStats.timeDistribution.nights += 1;
+      }
+      
+      // Update weekday distribution
+      const day = sessionStats.startTime.getDay();
+      switch (day) {
+        case 0: userStats.weekdayDistribution.sunday += 1; break;
+        case 1: userStats.weekdayDistribution.monday += 1; break;
+        case 2: userStats.weekdayDistribution.tuesday += 1; break;
+        case 3: userStats.weekdayDistribution.wednesday += 1; break;
+        case 4: userStats.weekdayDistribution.thursday += 1; break;
+        case 5: userStats.weekdayDistribution.friday += 1; break;
+        case 6: userStats.weekdayDistribution.saturday += 1; break;
+      }
+      
+      // Update game-specific statistics
+      const gameStats = userStats.gameStatistics.find(
+        gs => gs.gameName === sessionStats.gameName && gs.gameMode === sessionStats.gameMode
+      );
+      
+      if (gameStats) {
+        // Update existing game statistics
+        gameStats.sessionsPlayed += 1;
+        gameStats.bestScore = Math.max(gameStats.bestScore, sessionStats.score);
+        
+        // Recalculate average score
+        const totalScore = (gameStats.averageScore * (gameStats.sessionsPlayed - 1)) + sessionStats.score;
+        gameStats.averageScore = totalScore / gameStats.sessionsPlayed;
+        
+        // Update accuracy metrics
+        gameStats.bestAccuracy = Math.max(gameStats.bestAccuracy, sessionStats.accuracyRate);
+        
+        // Recalculate average accuracy for this game
+        const totalAccuracy = (gameStats.averageAccuracy * (gameStats.sessionsPlayed - 1)) + sessionStats.accuracyRate;
+        gameStats.averageAccuracy = totalAccuracy / gameStats.sessionsPlayed;
+        
+        // Update time metrics
+        gameStats.totalTime += sessionStats.duration;
+        gameStats.averageTime = gameStats.totalTime / gameStats.sessionsPlayed;
+        
+        // Update last played time
+        gameStats.lastPlayed = sessionStats.endTime;
+        
+        // Update category performance if needed
+        if (!gameStats.categoryPerformance) {
+          gameStats.categoryPerformance = [];
+        }
+        
+        // Update category stats
+        sessionStats.categoryPerformance.forEach(newCat => {
+          const existingCat = gameStats.categoryPerformance.find(c => c.category === newCat.category);
+          if (existingCat) {
+            const oldQuestions = existingCat.questionsAnswered || 0;
+            const newQuestions = newCat.total;
+            const totalQuestions = oldQuestions + newQuestions;
+            
+            // Weighted average for accuracy
+            existingCat.accuracy = 
+              ((existingCat.accuracy * oldQuestions) + (newCat.accuracy * newQuestions)) / totalQuestions;
+            existingCat.questionsAnswered = totalQuestions;
+          } else {
+            gameStats.categoryPerformance.push({
+              category: newCat.category,
+              accuracy: newCat.accuracy,
+              questionsAnswered: newCat.total
+            });
+          }
+        });
+        
+        // Update difficulty performance if needed
+        if (!gameStats.difficultyPerformance) {
+          gameStats.difficultyPerformance = {
+            easy: { accuracy: 0, questionsAnswered: 0 },
+            medium: { accuracy: 0, questionsAnswered: 0 },
+            hard: { accuracy: 0, questionsAnswered: 0 }
+          };
+        }
+        
+        // Update difficulty stats
+        const diffBreakdown = sessionStats.difficultyBreakdown;
+        Object.keys(diffBreakdown).forEach(diff => {
+          const existingDiff = gameStats.difficultyPerformance[diff];
+          const oldQuestions = existingDiff.questionsAnswered || 0;
+          const newQuestions = diffBreakdown[diff].total;
+          
+          if (newQuestions > 0) {
+            const totalQuestions = oldQuestions + newQuestions;
+            const newAccuracy = diffBreakdown[diff].correct / diffBreakdown[diff].total * 100;
+            
+            // Weighted average for accuracy
+            existingDiff.accuracy = 
+              ((existingDiff.accuracy * oldQuestions) + (newAccuracy * newQuestions)) / totalQuestions;
+            existingDiff.questionsAnswered = totalQuestions;
+          }
+        });
+      } else {
+        // Add new game statistics
+        const newGameStats = {
+          gameName: sessionStats.gameName,
+          gameMode: sessionStats.gameMode,
+          sessionsPlayed: 1,
+          bestScore: sessionStats.score,
+          averageScore: sessionStats.score,
+          bestAccuracy: sessionStats.accuracyRate,
+          averageAccuracy: sessionStats.accuracyRate,
+          totalTime: sessionStats.duration,
+          averageTime: sessionStats.duration,
+          lastPlayed: sessionStats.endTime,
+          categoryPerformance: sessionStats.categoryPerformance.map(cat => ({
+            category: cat.category,
+            accuracy: cat.accuracy,
+            questionsAnswered: cat.total
+          })),
+          difficultyPerformance: {
+            easy: {
+              accuracy: sessionStats.difficultyBreakdown.easy.total > 0 ? 
+                (sessionStats.difficultyBreakdown.easy.correct / sessionStats.difficultyBreakdown.easy.total * 100) : 0,
+              questionsAnswered: sessionStats.difficultyBreakdown.easy.total
+            },
+            medium: {
+              accuracy: sessionStats.difficultyBreakdown.medium.total > 0 ? 
+                (sessionStats.difficultyBreakdown.medium.correct / sessionStats.difficultyBreakdown.medium.total * 100) : 0,
+              questionsAnswered: sessionStats.difficultyBreakdown.medium.total
+            },
+            hard: {
+              accuracy: sessionStats.difficultyBreakdown.hard.total > 0 ? 
+                (sessionStats.difficultyBreakdown.hard.correct / sessionStats.difficultyBreakdown.hard.total * 100) : 0,
+              questionsAnswered: sessionStats.difficultyBreakdown.hard.total
+            }
+          }
+        };
+        
+        userStats.gameStatistics.push(newGameStats);
+      }
+      
+      // Update streak metrics
+      const lastActive = userStats.progressMetrics.lastActiveDate;
+      const currentDate = new Date();
+      currentDate.setHours(0, 0, 0, 0);
+      
+      if (lastActive) {
+        const lastActiveDate = new Date(lastActive);
+        lastActiveDate.setHours(0, 0, 0, 0);
+        
+        const diffDays = Math.floor((currentDate.getTime() - lastActiveDate.getTime()) / (1000 * 60 * 60 * 24));
+        
+        if (diffDays === 1) {
+          // Consecutive day, increment streak
+          userStats.progressMetrics.currentStreak += 1;
+          userStats.progressMetrics.longestStreak = Math.max(
+            userStats.progressMetrics.longestStreak,
+            userStats.progressMetrics.currentStreak
+          );
+        } else if (diffDays > 1) {
+          // Streak broken
+          userStats.progressMetrics.currentStreak = 1;
